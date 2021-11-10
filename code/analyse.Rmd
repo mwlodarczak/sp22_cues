@@ -1,0 +1,262 @@
+---
+title: Contribution of voice quality to prediction of turn-taking events
+author: Marcin Włodarczak, Mattias Heldner
+date: "`r format(Sys.time(), '%d %B %Y, %H:%M')`"
+output: pdf_document
+editor_options:
+  chunk_output_type: console
+chunk_output_type: console
+---
+
+```{r echo=FALSE,message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = FALSE, size = 'footnotesize', fig.align = 'center', out.width = '0.7\\textwidth', cache = FALSE)
+
+library('tidyverse')
+theme_set(theme_bw())
+library('mlogit')
+
+zscore <- function(x) {
+  return((x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE))
+}
+```
+
+Read in the data and create derivative columns:
+```{r}
+vq <- read.csv('../data/features/vq.csv', na.strings = 'nan')
+vq$prev_is_vsu <- vq$prev_dur < 1
+vq$next_is_vsu <- vq$next_dur < 1
+```
+
+Remove the session withe the creaky speaker (`191212-1`) and the loose throat mic (`191125-2`):
+```{r}
+vq <- vq[vq$session_id != '191212-1' & vq$session_id != '191125-2',]
+```
+
+Data filtering: remove all interval where the preceding spurt was a VSU.
+```{r}
+100 * xtabs(~ prev_is_vsu, vq) / nrow(vq)
+vq <- vq[vq$prev_is_vsu == FALSE,]
+```
+
+
+Z-score features (per speaker):
+```{r}
+vq <- vq %>% group_by(prev_spkr) %>%
+  mutate(pitch_z = zscore(pitch),
+         intensity_z = zscore(intensity),
+         alpha_z = zscore(alpha),
+         cpps_z = zscore(cpps),
+         h1h2_z = zscore(h1h2),
+         hrf_z = zscore(hrf)) %>%
+  ungroup
+```
+
+Remove rows with values outside of $\pm 3$ standard deviations:
+```{r}
+# Features to analyze.
+features <- c('pitch', 'intensity', 'cpps', 'alpha', 'h1h2', 'hrf')
+
+vq <- vq %>%
+  pivot_longer(all_of(paste0(features, '_z')), names_to = 'feature') %>%
+  filter(abs(value) <= 3) %>%
+  pivot_wider(names_from = 'feature', values_from = 'value') %>% 
+  drop_na(any_of(paste0(features, '_z')))
+```
+
+We end up with `r nrow(vq)` data points:
+```{r}
+xtabs(~ intr_type, vq)
+```
+
+# Correlations between features
+
+```{r}
+pairwise_cors <- round(cor(vq[paste0(features, '_z')]), 2)
+pairwise_cors[upper.tri(pairwise_cors)] <- NA
+pairwise_cors
+```
+
+# Feature distributions
+
+Distribution of VQ features across interval type for non-VSU intervals.
+```{r}
+# Here we do not use H1H2
+features <- c('pitch', 'intensity', 'cpps', 'alpha', 'hrf')
+vq_long <- pivot_longer(vq, all_of(paste0(features, '_z')), names_to = 'feature')
+
+labels_out <- as_labeller(c(pitch_z = 'f[o]', alpha_z = 'alpha', hrf_z = 'HRF',
+                intensity_z = 'intensity', cpps_z = 'CPPS'), label_parsed)
+vq_long %>%
+  ggplot(aes(x = intr_type, y = value)) +
+  geom_boxplot(width = 0.5, outlier.size = 0.2) +
+  ylab('feature value (sd)') +
+  xlab('interval type') +
+  facet_wrap( ~ feature,  nrow = 1, labeller = labels_out) +
+  theme_bw(9) +
+  theme(strip.background = element_rect(fill = 'white', linetype = 0))
+ggsave('figs_publish/feat_distr.pdf', width = 20, height = 6, units = 'cm')
+```
+
+Pitch range values per category:
+```{r}
+tapply(vq$pitch_range, vq$intr_type, median)
+```
+
+
+# Bootstrap feature importance
+
+With 10,000 iterations, this part takes a fair amount of time!
+
+## Comparison against the full model
+
+```{r}
+bootstrap_chisq_full <- function(predictors, data, B) {
+  res <- matrix(NA, B, length(predictors) + 2)
+  n <- nrow(data)
+  formula_full <- as.formula(
+    paste('intr_type ~ 0 | ', paste(predictors, collapse = ' + ')))
+  
+  for (i in 1:B) {
+    
+    if (i %% 100 == 0) {
+      print(i)
+    }
+    
+    samp <- sample(1:n, n, TRUE)
+    boot_data <- data[samp,]
+    boot_data$id <- 1:n
+    boot_data <- mlogit.data(boot_data, id.var = 'id', choice = 'intr_type',
+                             shape = "wide")
+     
+    m_full <- mlogit(formula_full, boot_data)
+    
+    for (j in 1:length(predictors)) {
+      boot_formula <- as.formula(
+        paste0('intr_type ~ 0 | ', paste(predictors[-j], collapse = ' + ')))
+      bootfit <- mlogit(boot_formula, data = boot_data)
+      boot_lrtest <- lrtest(bootfit, m_full)
+      res[i, j] <- boot_lrtest$Chisq[2] - boot_lrtest$Df[2]
+      
+    }
+    # Remove all VQ features
+    bootfit <- mlogit(intr_type ~ 0 | pitch_z + intensity_z, data = boot_data)
+    res[i, dim(res)[2] - 1] <- lrtest(bootfit, m_full)$Chisq[2] - lrtest(bootfit, m_full)$Df[2]
+    # Remove pitch and intensity
+    boot_formula <- as.formula(
+        paste0('intr_type ~ 0 | ', paste(setdiff(predictors, c('pitch_z', 'intensity_z')), 
+                                         collapse = ' + ')))
+    bootfit <- mlogit(boot_formula, data = boot_data)
+    res[i, dim(res)[2]] <- lrtest(bootfit, m_full)$Chisq[2] - lrtest(bootfit, m_full)$Df[2]
+  }
+  colnames(res) <- c(predictors, 'vq_all', 'pitch_int')
+  return(res)
+}
+
+
+predictors <- c('pitch_z', 'intensity_z', 'hrf_z', 'alpha_z', 'cpps_z')
+boot_res <- bootstrap_chisq_full(predictors, vq, 1e4)
+
+boot_means <- apply(boot_res, 2, mean)
+boot_ci <- t(apply(boot_res, 2, quantile, probs = c(0.025, 0.975)))
+boot_df <- data.frame(predictor = c(predictors, 'vq_all', 'pitch_int'),
+                      mean = boot_means, ci_lo = boot_ci[,1],
+                      ci_hi = boot_ci[,2])
+
+
+boot_df$predictor <- recode_factor(as.factor(boot_df$predictor), 
+              cpps_z = 'CPPS', alpha_z = 'alpha', hrf_z = 'HRF', 
+              pitch_z = 'f0', intensity_z = 'intensity',vq_all = 'VQ all',
+              pitch_int = 'f0 + intensity', .ordered = TRUE)
+
+ggplot(boot_df, aes(x = fct_rev(predictor), y = mean)) + 
+  geom_point(size = 0.5) +
+  geom_errorbar(aes(ymin=ci_lo, ymax=ci_hi), width = 0, size=0.25) +
+  coord_flip() +
+  theme_bw(9) +
+  ylab(expression(chi^2 - df)) +
+  xlab('') +
+  scale_x_discrete(breaks = c('CPPS', 'alpha', 'HRF', 'f0', 'intensity', 
+                              'VQ all', 'f0 + intensity'),
+                   labels = c('CPPS', expression(alpha), 'HRF', expression(f[o]), 
+                              'intensity', 'VQ all', expression(f[o] + intensity)))
+ggsave('figs_publish/feature_importance_full.pdf', width = 10, height = 5, units = 'cm')
+```
+
+
+## Comparison against an intercept-only model
+
+```{r}
+bootstrap_chisq_intercept <- function(predictors, data, B) {
+  
+  res <- matrix(NA, B, length(predictors) + 2)
+  n <- nrow(data)
+
+  
+  for (i in 1:B) {
+    
+    if (i %% 100 == 0) {
+      print(i)
+    }
+    
+    samp <- sample(1:n , n, TRUE)
+    boot_data <- data[samp,]
+    boot_data$id <- 1:n
+    boot_data <- mlogit.data(boot_data, id.var = 'id', choice = 'intr_type',
+                             shape = "wide")
+     
+    intercept_fit <- mlogit(intr_type ~ 0 | 1, boot_data)
+    
+    for (j in 1:length(predictors)) {
+      boot_formula <- as.formula(paste('intr_type ~ 0 | ', predictors[j]))
+      bootfit <- mlogit(boot_formula, data = boot_data)
+      boot_lrtest <- lrtest(intercept_fit, bootfit)
+      res[i, j] <- boot_lrtest$Chisq[2] - boot_lrtest$Df[2]
+      
+    }
+    # Add all VQ features at once
+    boot_formula <- as.formula(
+        paste0('intr_type ~ 0 | ', paste(setdiff(predictors, c('pitch_z', 'intensity_z')), 
+                                         collapse = ' + ')))
+    bootfit <- mlogit(boot_formula, data = boot_data)
+    boot_lrtest <- lrtest(intercept_fit, bootfit)
+    res[i, ncol(res) - 1] <- boot_lrtest$Chisq[2] - boot_lrtest$Df[2]
+    # Add pitch and intensity at once
+    bootfit <- mlogit(intr_type ~ 0 | pitch_z + intensity_z, data = boot_data)
+    boot_lrtest <- lrtest(intercept_fit, bootfit)
+    res[i, ncol(res)] <- boot_lrtest$Chisq[2] - boot_lrtest$Df[2]  
+    
+    
+  }
+  colnames(res) <- c(predictors, 'vq_all', 'pitch_int')
+  return(res)
+}
+
+predictors <- c('pitch_z', 'intensity_z', 'hrf_z', 'alpha_z', 'cpps_z')
+boot_res <- bootstrap_chisq_intercept(predictors, vq, 10000)
+boot_means <- apply(boot_res, 2, mean)
+boot_ci <- t(apply(boot_res, 2, quantile, probs = c(0.025, 0.975)))
+
+boot_df <- data.frame(predictor = c(predictors, 'vq_all', 'pitch_int'), 
+                      mean = boot_means, ci_lo = boot_ci[,1],
+                      ci_hi = boot_ci[,2])
+
+boot_df$predictor <- recode_factor(as.factor(boot_df$predictor), 
+              cpps_z = 'CPPS', alpha_z = 'alpha', hrf_z = 'HRF', 
+              pitch_z = 'f0', intensity_z = 'intensity',vq_all = 'VQ all',
+              pitch_int = 'f0 + intensity', .ordered = TRUE)
+
+ggplot(boot_df, aes(x = fct_rev(predictor), y = mean)) + 
+  geom_point(size = 0.5) +
+  geom_errorbar(aes(ymin=ci_lo, ymax=ci_hi), width = 0, size=0.25) +
+  coord_flip() +
+  theme_bw(9) +
+  ylab(expression(chi^2 - df)) +
+  xlab('') +
+  scale_x_discrete(breaks = c('CPPS', 'alpha', 'HRF', 'f0', 'intensity', 
+                              'VQ all', 'f0 + intensity'),
+                   labels = c('CPPS', expression(alpha), 'HRF', expression(f[o]), 
+                              'intensity', 'VQ all', expression(f[o] + intensity)))
+ggsave('figs_publish/feature_importance_intercept.pdf', width = 10, height = 5, units = 'cm')
+```
+
+
