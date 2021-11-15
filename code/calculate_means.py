@@ -21,7 +21,7 @@ def remove_low_peak(vq):
     dens = gaussian_kde(pitch)(pitch_xs)
     pitch_mode = np.argmax(dens)
     pitch_trough = np.argmin(dens[0:pitch_mode])
-    pitch_cols = ['pitch', 'h1h2', 'hrf', 'slope_lin', 'slope_log']
+    pitch_cols = ['pitch', 'h1h2', 'hrf']
     vq.loc[vq.pitch < pitch_xs[pitch_trough], pitch_cols] = np.nan
     return vq
 
